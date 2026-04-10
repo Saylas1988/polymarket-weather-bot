@@ -318,7 +318,8 @@ def run_paper_phase(
                     allocator_notes=alloc.get("allocator_notes") if isinstance(alloc.get("allocator_notes"), list) else None,
                     neighbor_cuts=alloc.get("neighbor_cuts") if isinstance(alloc.get("neighbor_cuts"), list) else None,
                     target_summary=alloc.get("target_sell_prices") if isinstance(alloc.get("target_sell_prices"), dict) else None,
-                )
+                ),
+                event_slug=event_slug,
             )
         except Exception:
             pass
@@ -576,7 +577,8 @@ def _update_and_exit_open_positions(
                         exit_kind="all_legs_hit",
                         realized_pnl=float(pnl),
                         cash_after=float(cash),
-                    )
+                    ),
+                    event_slug=slug,
                 )
             except Exception:
                 pass
@@ -639,7 +641,8 @@ def _update_and_exit_open_positions(
                         exit_reason="independent_leg_target_hit",
                         leg_realized_pnl=float(leg_pnl),
                         cash_after=float(cash),
-                    )
+                    ),
+                    event_slug=slug,
                 )
             except Exception:
                 pass
@@ -677,7 +680,8 @@ def _update_and_exit_open_positions(
                     realized_pnl=float(total_leg_pnl),
                     cash_after=float(cash),
                     extra_note="Все ноги закрыты (см. отдельные сообщения по ногам).",
-                )
+                ),
+                event_slug=slug,
             )
         except Exception:
             pass

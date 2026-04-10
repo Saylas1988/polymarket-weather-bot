@@ -36,6 +36,12 @@ from station_config import (
     iter_enabled_city_configs,
 )
 from verification_context import build_resolution_context
+from openmeteo_ensemble_cache import (
+    OpenMeteoEnsembleUnavailable,
+    get_ensemble_daily_json_cached,
+    log_ensemble_cycle_stats,
+    reset_ensemble_cycle_stats,
+)
 from telegram import Bot, Update
 from telegram.error import InvalidToken, NetworkError, TimedOut, TelegramError
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
@@ -429,21 +435,19 @@ def fetch_ensemble_tmax_members_for_date(
     Ensemble ECMWF (51 members) через Open‑Meteo.
     Возвращает (unit, members[51]) для temperature_2m_max на target_date.
     Координаты запроса — resolving station (station_config), не абстрактный центр города.
+    Полный JSON ответа кэшируется по (город/station coords, forecast_days, past_days, model),
+    чтобы D+1..D+3 в одном раунде не делали три одинаковых HTTP-запроса.
     """
     lat, lon = _get_city_coords(city_name)
-    data = _http_get_json(
-        OPEN_METEO_ENSEMBLE_URL,
-        params={
-            "latitude": lat,
-            "longitude": lon,
-            "daily": "temperature_2m_max",
-            "forecast_days": forecast_days,
-            "past_days": past_days,
-            "timezone": "UTC",
-            "models": OPEN_METEO_ENSEMBLE_MODEL,
-        },
-        timeout=30,
-        retries=4,
+    data = get_ensemble_daily_json_cached(
+        city_name=city_name,
+        lat=lat,
+        lon=lon,
+        forecast_days=forecast_days,
+        past_days=past_days,
+        model=OPEN_METEO_ENSEMBLE_MODEL,
+        ensemble_url=OPEN_METEO_ENSEMBLE_URL,
+        session=HTTP,
     )
     daily = data.get("daily") or {}
     times = daily.get("time") or []
@@ -623,6 +627,7 @@ def run_signals_round(*, respect_dedup: bool = True, ecmwf_bulletin_recheck: boo
     (хранится в stats.json).
     ecmwf_bulletin_recheck: True при внеочередном слоте после ECMWF — paper engine помечает recheck.
     """
+    reset_ensemble_cycle_stats()
     now = dt.datetime.now(dt.timezone.utc)
     cooldown = dt.timedelta(hours=_signal_cooldown_hours())
     stats = load_stats()
@@ -641,14 +646,10 @@ def run_signals_round(*, respect_dedup: bool = True, ecmwf_bulletin_recheck: boo
                 res = evaluate_signal_for_event(event_slug)
                 batch.append((event_slug, res, now))
 
-        try:
-            from paper_engine import init_paper_if_missing, run_paper_phase
+        # Сигналы в Telegram до paper phase, чтобы PAPER ENTRY мог reply на корневой сигнал в том же раунде.
+        from telegram_signal_linkage import record_signal_message
 
-            init_paper_if_missing()
-            run_paper_phase(batch, now=now, ecmwf_bulletin_recheck=ecmwf_bulletin_recheck)
-        except Exception as e:
-            log.exception("paper trading: %s", e)
-
+        chat_id_for_link = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
         for event_slug, res, _ in batch:
             if res.get("skip"):
                 continue
@@ -664,16 +665,31 @@ def run_signals_round(*, respect_dedup: bool = True, ecmwf_bulletin_recheck: boo
                     except (ValueError, TypeError):
                         pass
             msg = build_signal_message(res)
-            asyncio.run(send_telegram_text(msg))
+            try:
+                mid = asyncio.run(send_telegram_text(msg))
+            except Exception:
+                log.exception("telegram: не удалось отправить сигнал для %s", event_slug)
+                continue
             sent += 1
+            if mid is not None and chat_id_for_link:
+                record_signal_message(event_slug, chat_id_for_link, mid, now)
             _append_daily_signal_line(stats, res)
             if respect_dedup:
                 sent_map[event_slug] = {"at": now.replace(microsecond=0).isoformat()}
             save_stats(stats)
 
+        try:
+            from paper_engine import init_paper_if_missing, run_paper_phase
+
+            init_paper_if_missing()
+            run_paper_phase(batch, now=now, ecmwf_bulletin_recheck=ecmwf_bulletin_recheck)
+        except Exception as e:
+            log.exception("paper trading: %s", e)
+
         log.info("раунд проверки завершён, отправлено сигналов: %s", sent)
         return sent
     finally:
+        log_ensemble_cycle_stats()
         _record_last_round_finished()
 
 
@@ -1431,7 +1447,29 @@ def evaluate_signal_for_event(event_slug: str, *, run_date: dt.date | None = Non
     # Ensemble ECMWF members (51)
     # При backtest/анализе можем использовать past_days, чтобы target_date точно попал в окно.
     past_days = 7 if (run_date is not None and event_date < dt.datetime.now(dt.timezone.utc).date()) else 0
-    unit, members = fetch_ensemble_tmax_members_for_date(city, event_date, forecast_days=7, past_days=past_days)
+    try:
+        unit, members = fetch_ensemble_tmax_members_for_date(
+            city, event_date, forecast_days=7, past_days=past_days
+        )
+    except OpenMeteoEnsembleUnavailable as e:
+        out = {
+            "event_slug": event_slug,
+            "skip": True,
+            "reason": "openmeteo_ensemble_unavailable",
+            "openmeteo_rate_limited": bool(getattr(e, "rate_limited", False)),
+            "city": city,
+            "date": event_date.isoformat(),
+            **fd,
+        }
+        log.warning(
+            "ensemble недоступен для %s %s: %s (rate_limited=%s)",
+            city,
+            event_date.isoformat(),
+            e,
+            out["openmeteo_rate_limited"],
+        )
+        _journal_record_from_result(out)
+        return out
 
     event = _gamma_get_event_by_slug(event_slug)
     markets = event["markets"]
@@ -2016,25 +2054,85 @@ def build_signal_message(res: dict) -> str:
     return "\n".join(lines)
 
 
-async def send_telegram_text(text: str) -> None:
+async def send_telegram_text(
+    text: str,
+    *,
+    reply_to_message_id: int | None = None,
+) -> int | None:
+    """
+    Отправка в TELEGRAM_CHAT_ID. Возвращает message_id отправленного сообщения.
+    reply_to_message_id — опционально (для обычных сигналов не используется).
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         raise SystemExit("Нужно задать TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID.")
     bot = Bot(token=token)
+    kw: dict = {"chat_id": chat_id, "text": text}
+    if reply_to_message_id is not None:
+        kw["reply_to_message_id"] = int(reply_to_message_id)
+    msg = await bot.send_message(**kw)
+    return int(msg.message_id)
+
+
+async def send_telegram_text_reply_fallback(text: str, reply_to_message_id: int | None) -> None:
+    """
+    Для paper-событий: сначала reply на корневой сигнал; при любой ошибке Telegram — обычное сообщение.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        raise SystemExit("Нужно задать TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID.")
+    bot = Bot(token=token)
+    if reply_to_message_id is not None:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_to_message_id=int(reply_to_message_id),
+            )
+            return
+        except TelegramError as e:
+            log.warning(
+                "telegram reply_to=%s не принят (%s), отправляю без reply",
+                reply_to_message_id,
+                e,
+            )
+        except Exception as e:
+            log.warning(
+                "telegram reply_to=%s: неожиданная ошибка (%s), отправляю без reply",
+                reply_to_message_id,
+                e,
+            )
     await bot.send_message(chat_id=chat_id, text=text)
 
 
-def send_paper_telegram_safe(text: str) -> None:
+def send_paper_telegram_safe(text: str, *, event_slug: str | None = None) -> None:
     """
     Уведомления paper: не падает и не роняет движок при отсутствии токена / сетевой ошибке.
+    Если передан event_slug — по возможности reply на сохранённый корневой сигнал.
     """
     try:
         from paper_settings import paper_telegram_notifications_enabled, paper_trading_enabled
+        from telegram_signal_linkage import get_signal_thread_root
 
         if not paper_trading_enabled() or not paper_telegram_notifications_enabled():
             return
-        asyncio.run(send_telegram_text(text))
+        reply_to: int | None = None
+        if event_slug:
+            root = get_signal_thread_root(event_slug)
+            env_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+            if root and env_chat and str(root.get("chat_id")) == str(env_chat):
+                reply_to = int(root["message_id"])
+            elif root and env_chat:
+                log.debug(
+                    "telegram_signal_linkage: chat_id не совпал с TELEGRAM_CHAT_ID, reply отключён для %s",
+                    event_slug,
+                )
+        if reply_to is not None:
+            asyncio.run(send_telegram_text_reply_fallback(text, reply_to))
+        else:
+            asyncio.run(send_telegram_text(text))
     except SystemExit:
         log.warning("paper telegram: пропуск (нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
     except Exception as e:

@@ -1,0 +1,16 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.Python
+*.log
+signal_journal.jsonl
+paper_portfolio.json
+paper_trade_journal.jsonl
+paper_reports/
+stats.json
+_paper_verify_tmp/
+_paper_verify_tmp2/
+_paper_verify_tmp3/
+bot.log.*

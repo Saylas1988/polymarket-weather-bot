@@ -1,0 +1,34 @@
+=== Helsinki: координаты, Ensemble, Polymarket slug ===
+
+Координаты в боте: 60.1699, 24.9384
+Локальный сегодня (Europe/Helsinki): 2026-04-09
+
+--- D+1 (дата события 2026-04-10) ---
+slug: highest-temperature-in-helsinki-on-april-10-2026
+Polymarket: https://polymarket.com/event/highest-temperature-in-helsinki-on-april-10-2026
+Gamma JSON: https://gamma-api.polymarket.com/events/slug/highest-temperature-in-helsinki-on-april-10-2026
+Событие в Gamma (200): да
+Ensemble: unit='°C', control tmax=6.90, членов=51
+Gamma title: Highest temperature in Helsinki on April 10?
+Число рынков (бакетов): 11
+Пример вопроса [0]: Will the highest temperature in Helsinki be -2°C or below on April 10?
+
+--- D+2 (дата события 2026-04-11) ---
+slug: highest-temperature-in-helsinki-on-april-11-2026
+Polymarket: https://polymarket.com/event/highest-temperature-in-helsinki-on-april-11-2026
+Gamma JSON: https://gamma-api.polymarket.com/events/slug/highest-temperature-in-helsinki-on-april-11-2026
+Событие в Gamma (200): да
+Ensemble: unit='°C', control tmax=8.50, членов=51
+Gamma title: Highest temperature in Helsinki on April 11?
+Число рынков (бакетов): 11
+Пример вопроса [0]: Will the highest temperature in Helsinki be 3°C or below on April 11?
+
+--- D+3 (дата события 2026-04-12) ---
+slug: highest-temperature-in-helsinki-on-april-12-2026
+Polymarket: https://polymarket.com/event/highest-temperature-in-helsinki-on-april-12-2026
+Gamma JSON: https://gamma-api.polymarket.com/events/slug/highest-temperature-in-helsinki-on-april-12-2026
+Событие в Gamma (200): да
+Ensemble: unit='°C', control tmax=9.40, членов=51
+Gamma title: Highest temperature in Helsinki on April 12?
+Число рынков (бакетов): 11
+Пример вопроса [0]: Will the highest temperature in Helsinki be 4°C or below on April 12?

@@ -86,6 +86,40 @@ def paper_reports_dir() -> str:
     return d
 
 
+def paper_manual_journal_path() -> str:
+    """
+    Текстовый автожурнал входов (человекочитаемый), не JSON.
+    На Railway задайте PAPER_MANUAL_JOURNAL_PATH=/data/paper_manual_journal.txt (volume).
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.environ.get("PAPER_MANUAL_JOURNAL_PATH", os.path.join(base, "paper_manual_journal.txt"))
+
+
+def paper_verification_state_path() -> str:
+    """JSON: какие event_slug уже прошли автоверификацию итога рынка (дедуп)."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.environ.get("PAPER_VERIFICATION_STATE_PATH", os.path.join(base, "paper_verification_state.json"))
+
+
+def market_verification_enabled() -> bool:
+    """Автоверификация фактической tmax + победившего бакета после даты события."""
+    return _b("MARKET_VERIFY_ENABLED", "1")
+
+
+def market_verify_openmeteo_debug() -> bool:
+    """Добавить в запись verification поля openmeteo_reference_temperature_c (не для итога рынка)."""
+    return _b("MARKET_VERIFY_OPENMETEO_DEBUG", "0")
+
+
+def market_verify_min_full_days_after_event() -> int:
+    """
+    Дополнительное ожидание полных локальных суток после дня события.
+    0 — верифицировать, как только календарный день в городе уже следующий (D+1 локально).
+    1 — ждать ещё один день (полезно, если архив обновляется с задержкой).
+    """
+    return max(0, _i("MARKET_VERIFY_MIN_FULL_DAYS_AFTER_EVENT", "0"))
+
+
 # --- Комиссии (paper_fee_logic): базовый taker bps и форма от цены ---
 def paper_fee_taker_base_bps() -> float:
     """Базовые bps до поправки phi(p); fallback на PAPER_FEE_ENTRY_BPS."""

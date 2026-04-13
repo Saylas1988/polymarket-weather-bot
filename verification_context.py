@@ -40,7 +40,10 @@ def build_resolution_context(
         "event_slug": event_slug,
         "station_lat": station_lat,
         "station_lon": station_lon,
-        "notes": "stub: no external resolution fetch; use journal + Polymarket rules URL",
+        "notes": (
+            "station metadata для сопоставления с правилами Polymarket; фактическая верификация итога — "
+            "см. market_outcome_verify (Open-Meteo Archive) + paper_verification_state.json"
+        ),
     }
     if extra:
         ctx["extra"] = extra

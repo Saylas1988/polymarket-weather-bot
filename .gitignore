@@ -8,6 +8,7 @@ __pycache__/
 signal_journal.jsonl
 paper_portfolio.json
 paper_trade_journal.jsonl
+paper_manual_journal.txt
 paper_reports/
 stats.json
 telegram_signal_linkage.json

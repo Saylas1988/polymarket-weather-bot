@@ -36,6 +36,11 @@ from station_config import (
     iter_enabled_city_configs,
 )
 from verification_context import build_resolution_context
+from telegram_access import (
+    is_incoming_telegram_allowed,
+    log_if_telegram_blocked,
+    log_telegram_access_mode_once,
+)
 from openmeteo_config import (
     ecmwf_base_url,
     ensemble_base_url,
@@ -292,11 +297,30 @@ def _status_message_msk() -> str:
 
 
 async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_incoming_telegram_allowed(update):
+        log_if_telegram_blocked(update)
+        return
     if update.effective_chat:
         await context.bot.send_message(chat_id=update.effective_chat.id, text=_status_message_msk())
 
 
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_incoming_telegram_allowed(update):
+        log_if_telegram_blocked(update)
+        return
+    if not update.effective_chat:
+        return
+    text = (
+        "RainMakerBot.\n"
+        "Команды: /status — состояние, /paper — paper trading, /restart — перезапуск на Railway."
+    )
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+
+
 async def on_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_incoming_telegram_allowed(update):
+        log_if_telegram_blocked(update)
+        return
     if not update.effective_chat:
         return
     try:
@@ -312,6 +336,9 @@ RESTART_REPLY = "🔄 Отправляю сигнал на перезапуск.
 
 
 async def on_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_incoming_telegram_allowed(update):
+        log_if_telegram_blocked(update)
+        return
     if update.effective_chat:
         await context.bot.send_message(chat_id=update.effective_chat.id, text=RESTART_REPLY)
 
@@ -694,6 +721,15 @@ def run_signals_round(*, respect_dedup: bool = True, ecmwf_bulletin_recheck: boo
             run_paper_phase(batch, now=now, ecmwf_bulletin_recheck=ecmwf_bulletin_recheck)
         except Exception as e:
             log.exception("paper trading: %s", e)
+
+        try:
+            from market_outcome_verify import run_market_outcome_verification_pass
+
+            n = run_market_outcome_verification_pass(now=now)
+            if n:
+                log.info("market outcome verification: новых верификаций: %s", n)
+        except Exception as e:
+            log.exception("market outcome verification: %s", e)
 
         log.info("раунд проверки завершён, отправлено сигналов: %s", sent)
         return sent
@@ -2537,9 +2573,11 @@ def main() -> None:
     # 2) Погода в консоль (как в ТЗ этап 2)
     log_weather_once()
 
-    # 3) Telegram: /status, /restart
+    # 3) Telegram: /start, /status, /paper, /restart
+    log_telegram_access_mode_once()
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     app: Application = ApplicationBuilder().token(token).build()
+    app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("status", on_status))
     app.add_handler(CommandHandler("paper", on_paper))
     app.add_handler(CommandHandler("restart", on_restart))

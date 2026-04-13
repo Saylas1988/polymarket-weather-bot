@@ -276,6 +276,13 @@ def run_paper_phase(
         if isinstance(ncuts, list) and len(ncuts) > 0:
             portfolio["stats"]["allocator_partial_cuts"] = int(portfolio["stats"].get("allocator_partial_cuts") or 0) + 1
 
+        try:
+            from paper_manual_journal import append_paper_manual_journal_entry
+
+            append_paper_manual_journal_entry(pos, res)
+        except Exception:
+            pass
+
         _journal(
             path,
             "position_opened",

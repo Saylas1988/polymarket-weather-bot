@@ -27,6 +27,11 @@ _ENSEMBLE_FREE = "https://ensemble-api.open-meteo.com/v1/ensemble"
 _ECMWF_CUSTOMER = "https://customer-api.open-meteo.com/v1/ecmwf"
 _ENSEMBLE_CUSTOMER = "https://customer-ensemble-api.open-meteo.com/v1/ensemble"
 
+# Historical Weather (Archive API) — дневные агрегаты для верификации итога рынка.
+# См. https://open-meteo.com/en/docs/historical-weather-api
+# При OPENMETEO_API_KEY добавляется &apikey=... (как для ECMWF/ensemble).
+_ARCHIVE_FREE = "https://archive-api.open-meteo.com/v1/archive"
+
 
 def openmeteo_api_key() -> str:
     """Ключ Professional API; только из окружения, без дефолта в коде."""
@@ -43,6 +48,18 @@ def ecmwf_base_url() -> str:
 
 def ensemble_base_url() -> str:
     return _ENSEMBLE_CUSTOMER if is_openmeteo_paid_mode() else _ENSEMBLE_FREE
+
+
+def archive_base_url() -> str:
+    """
+    Historical Weather API (daily archive). По умолчанию публичный archive-api.open-meteo.com;
+    с OPENMETEO_API_KEY к запросу добавляется apikey (см. merge_openmeteo_auth).
+    Переопределение: OPENMETEO_ARCHIVE_BASE_URL — полный URL до /v1/archive включительно.
+    """
+    raw = os.environ.get("OPENMETEO_ARCHIVE_BASE_URL", "").strip()
+    if raw:
+        return raw.rstrip("/")
+    return _ARCHIVE_FREE
 
 
 def merge_openmeteo_auth(params: dict[str, Any]) -> dict[str, Any]:

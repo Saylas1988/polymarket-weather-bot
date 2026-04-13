@@ -36,6 +36,12 @@ from station_config import (
     iter_enabled_city_configs,
 )
 from verification_context import build_resolution_context
+from openmeteo_config import (
+    ecmwf_base_url,
+    ensemble_base_url,
+    log_openmeteo_mode_once,
+    merge_openmeteo_auth,
+)
 from openmeteo_ensemble_cache import (
     OpenMeteoEnsembleUnavailable,
     get_ensemble_daily_json_cached,
@@ -46,9 +52,9 @@ from telegram import Bot, Update
 from telegram.error import InvalidToken, NetworkError, TimedOut, TelegramError
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-OPEN_METEO_ECMWF_URL = "https://api.open-meteo.com/v1/ecmwf"
-OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 OPEN_METEO_ENSEMBLE_MODEL = "ecmwf_ifs025"  # ECMWF IFS 0.25° Ensemble (51 members)
+# Базовые URL ECMWF / ensemble: openmeteo_config.ecmwf_base_url / ensemble_base_url
+# (public api.* / ensemble-api.* или customer-* при OPENMETEO_API_KEY).
 POLYMARKET_GAMMA_BASE = "https://gamma-api.polymarket.com"
 
 # Переиспользуем соединения (быстрее, меньше зависаний)
@@ -359,15 +365,18 @@ def fetch_ecmwf_max_temperatures(lat: float, lon: float, forecast_days: int = 4)
     Важно: Open‑Meteo часто включает "сегодня" как первый день.
     Чтобы уверенно покрыть D+1/D+2/D+3, по умолчанию берём 4 дня.
     """
+    log_openmeteo_mode_once()
     resp = requests.get(
-        OPEN_METEO_ECMWF_URL,
-        params={
-            "latitude": lat,
-            "longitude": lon,
-            "daily": "temperature_2m_max",
-            "forecast_days": forecast_days,
-            "timezone": "UTC",
-        },
+        ecmwf_base_url(),
+        params=merge_openmeteo_auth(
+            {
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "temperature_2m_max",
+                "forecast_days": forecast_days,
+                "timezone": "UTC",
+            }
+        ),
         timeout=30,
     )
     resp.raise_for_status()
@@ -446,7 +455,7 @@ def fetch_ensemble_tmax_members_for_date(
         forecast_days=forecast_days,
         past_days=past_days,
         model=OPEN_METEO_ENSEMBLE_MODEL,
-        ensemble_url=OPEN_METEO_ENSEMBLE_URL,
+        ensemble_url=ensemble_base_url(),
         session=HTTP,
     )
     daily = data.get("daily") or {}
@@ -798,6 +807,59 @@ def _ensemble_members_in_bucket(member_vals: list[float], bucket: dict) -> int:
     return cnt
 
 
+def _ensemble_run_delta_threshold() -> float:
+    """Минимальная |Δp_main|, чтобы считать тренд stronger/weaker (не шум)."""
+    return max(0.005, float(os.environ.get("ENSEMBLE_RUN_DELTA_THRESHOLD", "0.02")))
+
+
+def _compare_ensemble_previous_model_run(
+    city: str,
+    event_date: dt.date,
+    *,
+    past_days: int,
+    forecast_days: int,
+    ladder_unit: str,
+    main: dict,
+    p_main: float,
+) -> tuple[float | None, float | None, str]:
+    """
+    Сравнение «текущий» прогон ECMWF ensemble vs более ранний архивный прогон.
+
+    Реализация: второй запрос к ensemble API с past_days+1 (глубже в архив Open-Meteo).
+    Для одной и той же даты события event_date считаем долю членов в том же бакете main,
+    что и для текущего сигнала (apples-to-apples).
+
+    Ограничение: это приближение к «предыдущему прогону модели» (см. past_days в Ensemble API),
+    не обязательно ровно предыдущий 6-часовой цикл ECMWF.
+    """
+    pd_prev = past_days + 1
+    if pd_prev > 15:
+        return None, None, "unavailable"
+    try:
+        _, members_prev_raw = fetch_ensemble_tmax_members_for_date(
+            city, event_date, forecast_days=forecast_days, past_days=pd_prev
+        )
+        if ladder_unit == "C":
+            mprev = members_prev_raw
+        else:
+            mprev = [_c_to_f(x) for x in members_prev_raw]
+        p_prev = _ensemble_members_in_bucket(mprev, main) / 51.0
+        delta = p_main - p_prev
+        thr = _ensemble_run_delta_threshold()
+        if delta > thr:
+            trend = "stronger"
+        elif delta < -thr:
+            trend = "weaker"
+        else:
+            trend = "unchanged"
+        return p_prev, delta, trend
+    except OpenMeteoEnsembleUnavailable:
+        return None, None, "unavailable"
+    except Exception as e:
+        log.debug("ensemble previous-run compare skipped: %s", e)
+        return None, None, "unavailable"
+
+
 def _gamma_market_stable_ids(m: dict) -> tuple[str, str]:
     """Стабильные id из Gamma для сопоставления ног при mark/update (не только question)."""
     mid = str(m.get("id") or "").strip()
@@ -823,11 +885,19 @@ def cmd_check_slugs() -> None:
 
 def test_openmeteo() -> list[float]:
     lat, lon = _get_city_coords("London")
-    url = (
-        f"https://api.open-meteo.com/v1/ecmwf"
-        f"?latitude={lat}&longitude={lon}&daily=temperature_2m_max&forecast_days=3&timezone=UTC"
+    response = requests.get(
+        ecmwf_base_url(),
+        params=merge_openmeteo_auth(
+            {
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "temperature_2m_max",
+                "forecast_days": 3,
+                "timezone": "UTC",
+            }
+        ),
+        timeout=30,
     )
-    response = requests.get(url, timeout=30)
     response.raise_for_status()
     data = response.json()
 
@@ -850,19 +920,25 @@ def dump_openmeteo_example(city_name: str = "Paris") -> None:
     """
     lat, lon = _get_city_coords(city_name)
     fd = _forecast_diag(city_name)
-    url = (
-        "https://api.open-meteo.com/v1/ecmwf"
-        f"?latitude={lat}&longitude={lon}&daily=temperature_2m_max&forecast_days=3&timezone=UTC"
+    q = merge_openmeteo_auth(
+        {
+            "latitude": lat,
+            "longitude": lon,
+            "daily": "temperature_2m_max",
+            "forecast_days": 3,
+            "timezone": "UTC",
+        }
     )
+    safe_print = {k: v for k, v in q.items() if k != "apikey"}
     print("=== Open‑Meteo RAW ===")
     print(
         f"Город: {city_name} | station {fd['station_code']} ({fd['station_name']}) | "
         f"source_type={fd['source_type']} | forecast lat/lon={lat}, {lon} | mode={fd['city_mode']}"
     )
     print(f"Polymarket resolution URL: {fd['resolution_url']}")
-    print("Открой в браузере и сравни с консолью:")
-    print(url)
-    r = HTTP.get(url, timeout=30)
+    print("Запрос (apikey из OPENMETEO_API_KEY не печатается):")
+    print(f"{ecmwf_base_url()} + params {safe_print}")
+    r = HTTP.get(ecmwf_base_url(), params=q, timeout=30)
     r.raise_for_status()
     data = r.json()
     daily = data.get("daily") or {}
@@ -1203,6 +1279,10 @@ def _journal_record_from_result(res: dict) -> None:
             "lower_bucket_label": lbl(low_b) if isinstance(low_b, dict) else None,
             "upper_bucket_label": lbl(high_b) if isinstance(high_b, dict) else None,
             "p_main": res.get("p_main"),
+            "current_p_main": res.get("current_p_main"),
+            "previous_p_main": res.get("previous_p_main"),
+            "delta_model": res.get("delta_model"),
+            "trend_label": res.get("trend_label"),
             "analytical_price": res.get("analytical_price"),
             "entry_price_assumed": res.get("entry_price_assumed"),
             "best_bid_main": res.get("best_bid_main"),
@@ -1599,6 +1679,17 @@ def evaluate_signal_for_event(event_slug: str, *, run_date: dt.date | None = Non
     p_main = in_bucket / 51.0
     p_lower = _ensemble_members_in_bucket(member_vals, low_nb) / 51.0 if low_nb is not None else None
     p_upper = _ensemble_members_in_bucket(member_vals, high_nb) / 51.0 if high_nb is not None else None
+
+    previous_p_main, delta_model, trend_label = _compare_ensemble_previous_model_run(
+        city,
+        event_date,
+        past_days=past_days,
+        forecast_days=7,
+        ladder_unit=ladder_unit,
+        main=main,
+        p_main=p_main,
+    )
+
     gap_analytical = p_main - analytical_price
     gap_entry = p_main - entry_price_assumed
     gap = gap_analytical  # legacy: те же пороги GAP_THRESHOLD, что и раньше (от mid)
@@ -1696,6 +1787,10 @@ def evaluate_signal_for_event(event_slug: str, *, run_date: dt.date | None = Non
         "p_main_members": in_bucket,
         "p_lower": p_lower,
         "p_upper": p_upper,
+        "current_p_main": p_main,
+        "previous_p_main": previous_p_main,
+        "delta_model": delta_model,
+        "trend_label": trend_label,
         "gap_threshold": gap_threshold,
         "base_risk": base_risk,
         "stake": stake,
@@ -2031,6 +2126,14 @@ def build_signal_message(res: dict) -> str:
         mkt_line += f" | bid {mbb:.2f} / ask {mba:.2f}"
     mkt_line += f" | gap_ana: {gap*100:+.0f}%"
     lines.append(mkt_line)
+    tl = res.get("trend_label")
+    pp = res.get("previous_p_main")
+    if tl and tl != "unavailable" and pp is not None and res.get("delta_model") is not None:
+        tr_ru = {"stronger": "усилился", "weaker": "ослаб", "unchanged": "без изм."}.get(str(tl), str(tl))
+        lines.append(
+            f"🔁 Прогон модели: было {float(pp)*100:.0f}% → сейчас {float(res['current_p_main'])*100:.0f}% "
+            f"(Δ {float(res['delta_model'])*100:+.1f} п.п., {tr_ru})"
+        )
     if res.get("entry_price_assumed") is not None:
         sp = res.get("spread_main")
         sp_txt = f"{sp:.3f}" if isinstance(sp, (int, float)) else "n/a"

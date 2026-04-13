@@ -15,6 +15,8 @@ from typing import Any
 
 import requests
 
+from openmeteo_config import log_openmeteo_mode_once, merge_openmeteo_auth, openmeteo_mode_label
+
 log = logging.getLogger("rainmaker")
 
 # Дефолт 2700 с (45 мин): между типичными циклами ~30 мин чаще попадаем в hit,
@@ -70,8 +72,9 @@ def get_ensemble_cycle_stats() -> dict[str, int]:
 def log_ensemble_cycle_stats() -> None:
     s = get_ensemble_cycle_stats()
     log.info(
-        "Open-Meteo ensemble round: http_requests=%s cache_hits_fresh=%s cache_misses=%s "
+        "Open-Meteo ensemble round [%s]: http_requests=%s cache_hits_fresh=%s cache_misses=%s "
         "stale_fallback=%s http_429=%s (ttl=%ss)",
+        openmeteo_mode_label(),
         s["http_requests"],
         s["cache_hits_fresh"],
         s["cache_misses"],
@@ -181,6 +184,7 @@ def get_ensemble_daily_json_cached(
     Возвращает полный JSON daily ensemble (как от Open-Meteo).
     Считает cache hit/miss, учитывает HTTP в статистике раунда.
     """
+    log_openmeteo_mode_once()
     key = _cache_key(city_name, lat, lon, forecast_days, past_days, model)
     fresh = _get_fresh_entry(key)
     if fresh is not None:
@@ -193,15 +197,17 @@ def get_ensemble_daily_json_cached(
         _cycle_stats["cache_misses"] += 1
     log.debug("Open-Meteo ensemble cache MISS key=%s", key[:4])
 
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "daily": "temperature_2m_max",
-        "forecast_days": forecast_days,
-        "past_days": past_days,
-        "timezone": "UTC",
-        "models": model,
-    }
+    params = merge_openmeteo_auth(
+        {
+            "latitude": lat,
+            "longitude": lon,
+            "daily": "temperature_2m_max",
+            "forecast_days": forecast_days,
+            "past_days": past_days,
+            "timezone": "UTC",
+            "models": model,
+        }
+    )
 
     with _lock:
         _cycle_stats["http_requests"] += 1

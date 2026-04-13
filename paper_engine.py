@@ -298,6 +298,12 @@ def run_paper_phase(
                 "ecmwf_recheck_context": ecmwf_bulletin_recheck,
                 "paper_close_mode": paper_close_mode(),
                 "exit_logic_version": exit_logic_version(),
+                "ensemble_run_trend": {
+                    "previous_p_main": res.get("previous_p_main"),
+                    "current_p_main": res.get("current_p_main"),
+                    "delta_model": res.get("delta_model"),
+                    "trend_label": res.get("trend_label"),
+                },
             },
         )
         portfolio["stats"]["paper_entries_today_msk"] = int(portfolio["stats"].get("paper_entries_today_msk") or 0) + 1

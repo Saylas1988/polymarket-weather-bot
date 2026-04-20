@@ -10,6 +10,7 @@ from datetime import date
 from typing import Any
 
 from paper_portfolio import load_portfolio
+from paper_portfolio_risk import refresh_portfolio_risk_state
 from paper_settings import (
     allocation_logic_version,
     exit_logic_version,
@@ -33,6 +34,18 @@ def _skipped_reasons_summary(skipped: dict[str, Any]) -> dict[str, Any]:
         out["note_duplicate_open"] = (
             "already_open считается «дубликатом» открытой позиции по тому же event_slug (one event = one position)."
         )
+    pr_notes = {
+        "portfolio_risk_hard_reduction": "лимит просадки unrealized (hard): новые входы запрещены",
+        "portfolio_risk_drawdown_pause": "лимит просадки unrealized (pause): новые входы запрещены",
+        "portfolio_risk_max_open_events": "достигнут PAPER_MAX_OPEN_EVENTS",
+        "portfolio_risk_max_city_events": "достигнут PAPER_MAX_OPEN_EVENTS_PER_CITY",
+        "portfolio_risk_max_total_open_exposure": "достигнут PAPER_MAX_TOTAL_OPEN_EXPOSURE_PCT",
+        "portfolio_risk_max_city_exposure": "достигнут PAPER_MAX_CITY_EXPOSURE_PCT",
+        "portfolio_risk_max_same_date_exposure": "достигнут PAPER_MAX_SAME_DATE_EXPOSURE_PCT",
+    }
+    for k, note in pr_notes.items():
+        if int(skipped.get(k) or 0) > 0:
+            out[f"note_{k}"] = note
     return out
 
 
@@ -44,6 +57,7 @@ def write_daily_report_file(for_day_msk: date | None = None) -> str:
     path = os.path.join(pdir, f"daily_{d.isoformat()}.json")
 
     port = load_portfolio()
+    refresh_portfolio_risk_state(port)
     open_n = len(port.get("open_positions") or {})
     closed = port.get("closed_positions") or []
     realized = float(port.get("realized_pnl") or 0)
@@ -80,6 +94,7 @@ def write_daily_report_file(for_day_msk: date | None = None) -> str:
         },
         "skipped_signals_summary": _skipped_reasons_summary(skipped),
         "exit_reasons_summary": stats.get("exit_reasons") or {},
+        "risk_state": port.get("risk_state"),
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -93,6 +108,7 @@ def write_weekly_report_file(week_end_msk: date | None = None) -> str:
     path = os.path.join(pdir, f"weekly_{d.isoformat()}.json")
 
     port = load_portfolio()
+    refresh_portfolio_risk_state(port)
     starting = float(port.get("starting_balance") or paper_start_balance())
     cash = float(port.get("current_cash") or 0)
     unreal = float(port.get("unrealized_pnl_estimate") or 0)
@@ -136,6 +152,7 @@ def write_weekly_report_file(week_end_msk: date | None = None) -> str:
         },
         "skipped_signals_summary": _skipped_reasons_summary(skipped),
         "exit_reasons_summary": stats.get("exit_reasons") or {},
+        "risk_state": port.get("risk_state"),
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)

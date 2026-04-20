@@ -731,6 +731,15 @@ def run_signals_round(*, respect_dedup: bool = True, ecmwf_bulletin_recheck: boo
         except Exception as e:
             log.exception("market outcome verification: %s", e)
 
+        try:
+            from paper_settlement import run_paper_settlement_pass
+
+            ns = run_paper_settlement_pass(now=now)
+            if ns:
+                log.info("paper settlement: закрыто позиций: %s", ns)
+        except Exception as e:
+            log.exception("paper settlement: %s", e)
+
         log.info("раунд проверки завершён, отправлено сигналов: %s", sent)
         return sent
     finally:

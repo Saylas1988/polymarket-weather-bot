@@ -120,6 +120,42 @@ def market_verify_min_full_days_after_event() -> int:
     return max(0, _i("MARKET_VERIFY_MIN_FULL_DAYS_AFTER_EVENT", "0"))
 
 
+# --- Portfolio risk caps (v2): gating перед новым входом; 0 = лимит отключён ---
+def paper_max_open_events() -> int:
+    """Максимум одновременно открытых event-позиций."""
+    return max(0, _i("PAPER_MAX_OPEN_EVENTS", "6"))
+
+
+def paper_max_open_events_per_city() -> int:
+    """Максимум открытых позиций на один city_key."""
+    return max(0, _i("PAPER_MAX_OPEN_EVENTS_PER_CITY", "2"))
+
+
+def paper_max_same_date_exposure_pct() -> float:
+    """Суммарный allocated по одной event_date / bankroll; доля 0..1."""
+    return max(0.0, _f("PAPER_MAX_SAME_DATE_EXPOSURE_PCT", "0.20"))
+
+
+def paper_max_city_exposure_pct() -> float:
+    """Суммарный allocated по городу / bankroll."""
+    return max(0.0, _f("PAPER_MAX_CITY_EXPOSURE_PCT", "0.25"))
+
+
+def paper_max_total_open_exposure_pct() -> float:
+    """Суммарный allocated по всем открытым / bankroll."""
+    return max(0.0, _f("PAPER_MAX_TOTAL_OPEN_EXPOSURE_PCT", "0.50"))
+
+
+def paper_unrealized_drawdown_pause_pct() -> float:
+    """Порог |unrealized|/bankroll: выше — новые входы запрещены (pause)."""
+    return max(0.0, _f("PAPER_UNREALIZED_DRAWDOWN_PAUSE_PCT", "0.07"))
+
+
+def paper_unrealized_drawdown_hard_pct() -> float:
+    """Глубже pause — режим hard_reduction (виден в risk_state; новые входы запрещены)."""
+    return max(0.0, _f("PAPER_UNREALIZED_DRAWDOWN_HARD_PCT", "0.12"))
+
+
 # --- Комиссии (paper_fee_logic): базовый taker bps и форма от цены ---
 def paper_fee_taker_base_bps() -> float:
     """Базовые bps до поправки phi(p); fallback на PAPER_FEE_ENTRY_BPS."""
@@ -170,6 +206,49 @@ def fee_logic_version() -> str:
 
 def exit_logic_version() -> str:
     return os.environ.get("PAPER_EXIT_LOGIC_VERSION", "4.0-independent-legs").strip()
+
+
+# --- Repricing / Weather Mispricing Scalping (v2 paper trade mode) ---
+def paper_repricing_v2_enabled() -> bool:
+    """Включить D+1-only paper, лёгкий sizing, time/drift exit (repricing-first)."""
+    return _b("PAPER_REPRICING_V2_ENABLED", "1")
+
+
+def paper_repricing_trade_logic_version() -> str:
+    return os.environ.get("PAPER_REPRICING_TRADE_LOGIC_VERSION", "1.0-repricing-scalp").strip()
+
+
+def paper_repricing_max_idea_usd() -> float:
+    """Верхняя граница бюджета одной идеи в режиме repricing (поверх risk %%)."""
+    return max(0.0, _f("PAPER_REPRICING_MAX_IDEA_USD", "25"))
+
+
+def paper_repricing_min_idea_usd() -> float:
+    """Если после кэпа бюджет ниже — вход пропускаем (не тянуть слишком мелкие сделки)."""
+    return max(0.0, _f("PAPER_REPRICING_MIN_IDEA_USD", "15"))
+
+
+def paper_time_exit_before_event_hours() -> float:
+    """
+    Обязательный выход до начала календарного дня события в TZ города:
+    deadline = local_midnight(event_date) - этот интервал (в часах), в UTC.
+    """
+    return max(0.0, _f("PAPER_TIME_EXIT_BEFORE_EVENT_HOURS", "18"))
+
+
+def paper_repricing_drift_p_main_delta() -> float:
+    """Выход по drift, если p_main упал относительно снимка на входе не меньше чем на эту величину (0..1)."""
+    return max(0.0, _f("PAPER_REPRICING_DRIFT_P_MAIN_DELTA", "0.08"))
+
+
+def paper_repricing_drift_exit_on_main_bucket_change() -> bool:
+    """Закрыть, если сменился main bucket (gamma_market_id главной ноги)."""
+    return _b("PAPER_REPRICING_DRIFT_MAIN_BUCKET_CHANGE", "1")
+
+
+def paper_repricing_drift_exit_on_trend_weaker() -> bool:
+    """Закрыть, если trend_label стал weaker при входе stronger или unchanged."""
+    return _b("PAPER_REPRICING_DRIFT_TREND_WEAKER", "1")
 
 
 # ---------------------------------------------------------------------------

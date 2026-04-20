@@ -15,7 +15,7 @@ from paper_settings import paper_portfolio_path, paper_start_balance
 def default_portfolio() -> dict[str, Any]:
     bal = paper_start_balance()
     return {
-        "version": 3,
+        "version": 4,
         "starting_balance": bal,
         "current_cash": bal,
         "open_positions": {},
@@ -38,6 +38,7 @@ def default_portfolio() -> dict[str, Any]:
             "paper_entries_today_msk": 0,
             "paper_exits_today_msk": 0,
             "paper_skipped_today_msk": 0,
+            "settlements_completed": 0,
         },
     }
 
@@ -50,6 +51,9 @@ def load_portfolio(path: str | None = None) -> dict[str, Any]:
         if not isinstance(data, dict):
             return default_portfolio()
         # миграция минимальная
+        v = int(data.get("version") or 3)
+        if v < 4:
+            data["version"] = 4
         data.setdefault("open_positions", {})
         data.setdefault("closed_positions", [])
         st = data.setdefault("stats", {})

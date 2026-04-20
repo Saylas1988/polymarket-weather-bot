@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from paper_allocation import generate_bucket_allocation
 from paper_fee_logic import fee_usd_exit_for_mode, round_fee as fee_round
 from paper_portfolio import load_portfolio, save_portfolio
+from paper_portfolio_risk import portfolio_risk_allows_new_entry, refresh_portfolio_risk_state
 from paper_settings import (
     allocation_logic_version,
     exit_logic_version,
@@ -24,8 +25,16 @@ from paper_settings import (
     paper_max_new_positions_per_cycle,
     paper_max_risk_per_trade_pct,
     paper_min_allocation_usd,
+    paper_repricing_drift_exit_on_main_bucket_change,
+    paper_repricing_drift_exit_on_trend_weaker,
+    paper_repricing_drift_p_main_delta,
+    paper_repricing_max_idea_usd,
+    paper_repricing_min_idea_usd,
+    paper_repricing_trade_logic_version,
+    paper_repricing_v2_enabled,
     paper_signal_ttl_minutes,
     paper_start_balance,
+    paper_time_exit_before_event_hours,
     paper_trade_journal_path,
     paper_trading_enabled,
     signal_logic_version,
@@ -117,6 +126,64 @@ def _ranking_key(item: tuple[str, dict[str, Any], dt.datetime]) -> tuple:
     return (ge_k, sp_k, vm_k, dep, ga_k)
 
 
+def _repricing_time_exit_deadline_utc(res: dict[str, Any], m: Any) -> str | None:
+    """Дедлайн UTC: локальная полночь даты события (TZ города) минус paper_time_exit_before_event_hours."""
+    ed = res.get("date")
+    city = res.get("city")
+    if not ed or not city:
+        return None
+    try:
+        d = dt.date.fromisoformat(str(ed)[:10])
+    except ValueError:
+        return None
+    tz_name = getattr(m, "CITY_TIMEZONE", {}).get(city) if m is not None else None
+    if not tz_name:
+        return None
+    h = paper_time_exit_before_event_hours()
+    zi = ZoneInfo(str(tz_name))
+    event_local_start = dt.datetime.combine(d, dt.time(0, 0), tzinfo=zi)
+    deadline_local = event_local_start - dt.timedelta(hours=h)
+    return deadline_local.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _repricing_drift_should_exit(pos: dict[str, Any], cur: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """
+    Упрощённые правила model-drift для repricing:
+    - падение p_main относительно снимка на входе ≥ порога;
+    - смена main bucket (gamma_market_id);
+    - trend_label стал weaker при входе stronger/unchanged.
+    """
+    meta = pos.get("repricing_meta") if isinstance(pos.get("repricing_meta"), dict) else None
+    if not meta:
+        return False, {"reason": "no_meta"}
+    if cur.get("skip"):
+        return False, {"skip_eval": True, "reason": cur.get("reason")}
+    entry_p = float(meta.get("p_main_entry") or 0)
+    cur_p = float(cur.get("p_main") if cur.get("p_main") is not None else cur.get("current_p_main") or 0)
+    thr = paper_repricing_drift_p_main_delta()
+    rules: list[str] = []
+    if entry_p - cur_p >= thr - 1e-12:
+        rules.append("p_main_drop")
+    if paper_repricing_drift_exit_on_main_bucket_change():
+        egm = str(meta.get("main_gamma_market_id_at_entry") or "").strip()
+        main_row = cur.get("main")
+        cgm = str(main_row.get("gamma_market_id") or "").strip() if isinstance(main_row, dict) else ""
+        if egm and cgm and egm != cgm:
+            rules.append("main_bucket_change")
+    te = str(meta.get("trend_at_entry") or "")
+    tn = str(cur.get("trend_label") or "")
+    if paper_repricing_drift_exit_on_trend_weaker() and tn == "weaker" and te in ("stronger", "unchanged"):
+        rules.append("trend_to_weaker")
+    detail = {
+        "rules_triggered": rules,
+        "entry_p_main": entry_p,
+        "current_p_main": cur_p,
+        "entry_trend": te,
+        "current_trend": tn,
+    }
+    return (len(rules) > 0), detail
+
+
 def _eligible(
     res: dict[str, Any],
     evaluated_at: dt.datetime,
@@ -141,6 +208,10 @@ def _eligible(
     age_s = (now - evaluated_at).total_seconds()
     if age_s > ttl_m * 60 + 5:  # небольшой запас на часы
         return False, "ttl_expired"
+    if paper_repricing_v2_enabled():
+        dep = int(res.get("depth") or 0)
+        if dep != 1:
+            return False, "repricing_dplus2_dplus3_skipped"
     return True, "ok"
 
 
@@ -167,6 +238,8 @@ def run_paper_phase(
 
     # 1) mark / exit по открытым
     _update_and_exit_open_positions(m, portfolio, now, path, ecmwf_bulletin_recheck=ecmwf_bulletin_recheck)
+    portfolio["unrealized_pnl_estimate"] = _compute_unrealized(portfolio)
+    refresh_portfolio_risk_state(portfolio)
 
     # 2) кандидаты на вход
     open_slugs = set(portfolio.get("open_positions") or {})
@@ -227,15 +300,25 @@ def run_paper_phase(
         stake = int(res.get("stake") or 0)
         risk_cap = cash * paper_max_risk_per_trade_pct()
         budget = float(min(stake, risk_cap, cash))
-        if budget < paper_min_allocation_usd():
+        if paper_repricing_v2_enabled():
+            budget = min(budget, paper_repricing_max_idea_usd())
+        min_alloc = paper_repricing_min_idea_usd() if paper_repricing_v2_enabled() else paper_min_allocation_usd()
+        if budget < min_alloc:
             portfolio["stats"]["total_signals_skipped"] = int(portfolio["stats"].get("total_signals_skipped") or 0) + 1
             portfolio["stats"]["paper_skipped_today_msk"] = int(portfolio["stats"].get("paper_skipped_today_msk") or 0) + 1
             sr = portfolio["stats"].setdefault("skipped_by_reason", {})
-            sr["insufficient_cash_or_min"] = int(sr.get("insufficient_cash_or_min") or 0) + 1
+            rsk = "insufficient_cash_or_min_repricing" if paper_repricing_v2_enabled() else "insufficient_cash_or_min"
+            sr[rsk] = int(sr.get(rsk) or 0) + 1
             _journal(
                 path,
                 "open_skipped",
-                {"event_slug": event_slug, "reason_if_skipped": "insufficient_cash_or_min", "cash_before": cash},
+                {
+                    "event_slug": event_slug,
+                    "reason_if_skipped": rsk,
+                    "cash_before": cash,
+                    "min_allocation_required": min_alloc,
+                    "repricing_v2": paper_repricing_v2_enabled(),
+                },
             )
             continue
 
@@ -250,6 +333,30 @@ def run_paper_phase(
         total_alloc = float(alloc.get("allocation_total_usd") or 0)
         fee_in = float(alloc.get("fee_estimate_entry") or 0)
         need = total_alloc + fee_in
+
+        ok_risk, risk_reason, risk_detail = portfolio_risk_allows_new_entry(
+            portfolio,
+            city_key=str(res.get("city_key") or ""),
+            event_date=str(res.get("date") or ""),
+            proposed_budget_usd=total_alloc,
+        )
+        if not ok_risk:
+            portfolio["stats"]["total_signals_skipped"] = int(portfolio["stats"].get("total_signals_skipped") or 0) + 1
+            portfolio["stats"]["paper_skipped_today_msk"] = int(portfolio["stats"].get("paper_skipped_today_msk") or 0) + 1
+            sr = portfolio["stats"].setdefault("skipped_by_reason", {})
+            sr[risk_reason] = int(sr.get(risk_reason) or 0) + 1
+            _journal(
+                path,
+                "open_skipped",
+                {
+                    "event_slug": event_slug,
+                    "city_key": res.get("city_key"),
+                    "reason_if_skipped": risk_reason,
+                    "portfolio_risk_detail": risk_detail,
+                },
+            )
+            continue
+
         if need > cash + 1e-6:
             portfolio["stats"]["total_signals_skipped"] = int(portfolio["stats"].get("total_signals_skipped") or 0) + 1
             portfolio["stats"]["paper_skipped_today_msk"] = int(portfolio["stats"].get("paper_skipped_today_msk") or 0) + 1
@@ -264,6 +371,8 @@ def run_paper_phase(
         cash = float(portfolio["current_cash"])
         opened += 1
         open_slugs.add(event_slug)
+        portfolio["unrealized_pnl_estimate"] = _compute_unrealized(portfolio)
+        refresh_portfolio_risk_state(portfolio)
 
         eff = str(alloc.get("structure_type_effective") or st)
         se = portfolio["stats"].setdefault("structure_entries", {})
@@ -305,6 +414,9 @@ def run_paper_phase(
                 "ecmwf_recheck_context": ecmwf_bulletin_recheck,
                 "paper_close_mode": paper_close_mode(),
                 "exit_logic_version": exit_logic_version(),
+                "strategy_mode": pos.get("strategy_mode"),
+                "repricing_trade_logic_version": pos.get("repricing_trade_logic_version"),
+                "repricing_meta": pos.get("repricing_meta"),
                 "ensemble_run_trend": {
                     "previous_p_main": res.get("previous_p_main"),
                     "current_p_main": res.get("current_p_main"),
@@ -331,6 +443,7 @@ def run_paper_phase(
                     allocator_notes=alloc.get("allocator_notes") if isinstance(alloc.get("allocator_notes"), list) else None,
                     neighbor_cuts=alloc.get("neighbor_cuts") if isinstance(alloc.get("neighbor_cuts"), list) else None,
                     target_summary=alloc.get("target_sell_prices") if isinstance(alloc.get("target_sell_prices"), dict) else None,
+                    strategy_mode=str(pos.get("strategy_mode") or ""),
                 ),
                 event_slug=event_slug,
             )
@@ -338,6 +451,7 @@ def run_paper_phase(
             pass
 
     portfolio["unrealized_pnl_estimate"] = _compute_unrealized(portfolio)
+    refresh_portfolio_risk_state(portfolio)
     portfolio["last_updated_utc"] = _utc_now().replace(microsecond=0).isoformat()
     save_portfolio(portfolio)
 
@@ -402,9 +516,28 @@ def _build_position_dict(
         add_leg("upper", res.get("high"), float(alloc.get("upper_bucket_usd") or 0))
 
     u = now.replace(microsecond=0)
+    strategy_mode = "legacy_hold"
+    repricing_meta: dict[str, Any] | None = None
+    rtlv = None
+    if paper_repricing_v2_enabled():
+        strategy_mode = "repricing_trade"
+        rtlv = paper_repricing_trade_logic_version()
+        main_row = res.get("main") if isinstance(res.get("main"), dict) else {}
+        repricing_meta = {
+            "time_exit_deadline_utc": _repricing_time_exit_deadline_utc(res, m),
+            "p_main_entry": float(res.get("p_main") or 0),
+            "trend_at_entry": res.get("trend_label"),
+            "main_gamma_market_id_at_entry": str(main_row.get("gamma_market_id") or ""),
+            "main_condition_id_at_entry": str(main_row.get("condition_id") or ""),
+            "hours_before_local_midnight_event": paper_time_exit_before_event_hours(),
+        }
     return {
         "paper_trade_id": tid,
         "status": "open",
+        "lifecycle_status": "open",
+        "strategy_mode": strategy_mode,
+        "repricing_trade_logic_version": rtlv,
+        "repricing_meta": repricing_meta,
         "opened_at_utc": u.isoformat(),
         "opened_at_msk": _msk_now().replace(microsecond=0).isoformat(),
         "city_key": cfg.city_key,
@@ -438,18 +571,108 @@ def _build_position_dict(
     }
 
 
+def _leg_is_active(leg: dict[str, Any]) -> bool:
+    st = leg.get("status")
+    return st not in ("closed_virtual", "closed_settlement")
+
+
 def _compute_unrealized(portfolio: dict[str, Any]) -> float:
     s = 0.0
     for pos in (portfolio.get("open_positions") or {}).values():
         if not isinstance(pos, dict):
             continue
         for leg in pos.get("legs") or []:
-            if leg.get("status") == "closed_virtual":
+            if not _leg_is_active(leg):
                 continue
             u = leg.get("current_unrealized_pnl_estimate")
             if isinstance(u, (int, float)):
                 s += float(u)
     return round(s, 4)
+
+
+def _repricing_forced_liquidation(
+    m: Any,
+    slug: str,
+    pos: dict[str, Any],
+    legs: list[dict[str, Any]],
+    markets: list[Any],
+    now: dt.datetime,
+    *,
+    exit_kind: str,
+    exit_detail: dict[str, Any],
+    exit_mode: str,
+    journal_path: str,
+) -> tuple[float, float] | None:
+    """
+    Закрыть все активные ноги по рынку (mid/bid в зависимости от exit_mode).
+    Возвращает (total_realized_pnl, cash_inflow_net_of_exit_fees).
+    Если для какой-то ноги нет цены — None, состояние не меняем (следующий цикл).
+    """
+    now_u = now if now.tzinfo else now.replace(tzinfo=dt.timezone.utc)
+    active = [lg for lg in legs if _leg_is_active(lg)]
+    if not active:
+        return None
+
+    priced: list[tuple[dict[str, Any], float]] = []
+    for leg in active:
+        mk = _find_market_for_leg(markets, leg)
+        mark = None
+        bb = None
+        if mk is not None:
+            liq = m._yes_price_and_liquidity(mk)
+            mark = float(liq["yes"])
+            bb = liq.get("best_bid")
+        else:
+            cm = leg.get("current_mark_price")
+            if isinstance(cm, (int, float)):
+                mark = float(cm)
+        if mark is None:
+            return None
+        if exit_mode == "taker_like":
+            px = mark
+        else:
+            px = float(bb) if bb is not None else mark
+        priced.append((leg, px))
+
+    total_pnl = 0.0
+    cash_add = 0.0
+    for leg, px in priced:
+        ctr = float(leg.get("estimated_contracts") or 0)
+        proceeds = px * ctr
+        fee_out_leg = fee_round(fee_usd_exit_for_mode(proceeds, px, mode=exit_mode))
+        leg_cost = float(leg.get("allocated_usd") or 0)
+        fee_in_leg = float(leg.get("entry_fee_allocated") or 0)
+        leg_pnl = proceeds - leg_cost - fee_in_leg - fee_out_leg
+        total_pnl += leg_pnl
+        cash_add += proceeds - fee_out_leg
+        leg["status"] = "closed_virtual"
+        leg["closed_at_utc"] = now_u.replace(microsecond=0).isoformat()
+        leg["virtual_realized_pnl"] = round(leg_pnl, 4)
+        leg["exit_fee_paid"] = fee_out_leg
+        leg["repricing_forced_exit"] = exit_kind
+        _journal(
+            journal_path,
+            "leg_closed_virtual",
+            {
+                "event_slug": slug,
+                "paper_trade_id": pos.get("paper_trade_id"),
+                "leg_key": leg.get("leg_key"),
+                "leg_realized_pnl": round(leg_pnl, 4),
+                "repricing_forced_exit": exit_kind,
+                "exit_detail": exit_detail,
+            },
+        )
+
+    pos["status"] = "closed"
+    pos["lifecycle_status"] = "closed"
+    pos["closed_at_utc"] = now_u.replace(microsecond=0).isoformat()
+    pos["realized_pnl"] = round(total_pnl, 4)
+    pos["trade_pnl_pre_settlement"] = round(total_pnl, 4)
+    pos["settlement_pnl"] = 0.0
+    pos["final_pnl"] = round(total_pnl, 4)
+    pos["exit_kind"] = exit_kind
+    pos["repricing_exit_detail"] = exit_detail
+    return (total_pnl, cash_add)
 
 
 def _update_and_exit_open_positions(
@@ -493,7 +716,7 @@ def _update_and_exit_open_positions(
         all_hit = True
 
         for leg in legs:
-            if leg.get("status") == "closed_virtual":
+            if not _leg_is_active(leg):
                 continue
 
             mk = _find_market_for_leg(markets, leg)
@@ -537,6 +760,107 @@ def _update_and_exit_open_positions(
             },
         )
 
+        rmeta = pos.get("repricing_meta") if isinstance(pos.get("repricing_meta"), dict) else None
+        if rmeta and legs:
+            force_kind: str | None = None
+            exit_detail: dict[str, Any] = {}
+            dl_s = rmeta.get("time_exit_deadline_utc")
+            time_hit = False
+            if dl_s:
+                try:
+                    ds = str(dl_s).replace("Z", "+00:00")
+                    dl = dt.datetime.fromisoformat(ds)
+                    if dl.tzinfo is None:
+                        dl = dl.replace(tzinfo=dt.timezone.utc)
+                    nu = now if now.tzinfo else now.replace(tzinfo=dt.timezone.utc)
+                    time_hit = nu >= dl.astimezone(dt.timezone.utc)
+                except Exception:
+                    time_hit = False
+            if time_hit:
+                force_kind = "repricing_time_exit"
+                exit_detail = {"reason": "time_deadline", "deadline_utc": dl_s}
+            else:
+                try:
+                    cur_eval = m.evaluate_signal_for_event(slug)
+                    drift_yes, drift_d = _repricing_drift_should_exit(pos, cur_eval)
+                    if drift_yes:
+                        force_kind = "repricing_model_drift"
+                        exit_detail = drift_d
+                except Exception as e:
+                    _journal(
+                        journal_path,
+                        "warning",
+                        {"event_slug": slug, "repricing_drift_eval_error": str(e)},
+                    )
+            if force_kind:
+                liq_res = _repricing_forced_liquidation(
+                    m,
+                    slug,
+                    pos,
+                    legs,
+                    markets,
+                    now,
+                    exit_kind=force_kind,
+                    exit_detail=exit_detail,
+                    exit_mode=exit_mode,
+                    journal_path=journal_path,
+                )
+                if liq_res is None:
+                    _journal(
+                        journal_path,
+                        "warning",
+                        {
+                            "event_slug": slug,
+                            "repricing_forced_close_aborted": force_kind,
+                            "reason": "missing_market_price_for_leg",
+                        },
+                    )
+                else:
+                    rp, cc = liq_res
+                    realized += rp
+                    cash += cc
+                    closed.append(pos)
+                    to_del.append(slug)
+                    ex[force_kind] = int(ex.get(force_kind) or 0) + 1
+                    stats["paper_exits_today_msk"] = int(stats.get("paper_exits_today_msk") or 0) + 1
+                    _journal(
+                        journal_path,
+                        "position_closed",
+                        {
+                            "event_slug": slug,
+                            "paper_trade_id": pos.get("paper_trade_id"),
+                            "lifecycle_status": pos.get("lifecycle_status"),
+                            "trade_pnl_pre_settlement": pos.get("trade_pnl_pre_settlement"),
+                            "settlement_pnl": pos.get("settlement_pnl"),
+                            "final_pnl": pos.get("final_pnl"),
+                            "realized_pnl": round(rp, 4),
+                            "cash_after": round(cash, 4),
+                            "exit_kind": force_kind,
+                            "repricing_exit_detail": exit_detail,
+                            "strategy_mode": pos.get("strategy_mode"),
+                        },
+                    )
+                    try:
+                        from paper_telegram_messages import format_paper_position_closed_message
+
+                        extra = f"repricing | {force_kind}"
+                        if isinstance(exit_detail, dict) and exit_detail.get("rules_triggered"):
+                            extra += f" | rules={exit_detail.get('rules_triggered')}"
+                        m.send_paper_telegram_safe(
+                            format_paper_position_closed_message(
+                                display_name_en=str(pos.get("display_name_en") or "?"),
+                                event_slug=slug,
+                                exit_kind=force_kind,
+                                realized_pnl=float(rp),
+                                cash_after=float(cash),
+                                extra_note=extra,
+                            ),
+                            event_slug=slug,
+                        )
+                    except Exception:
+                        pass
+                    continue
+
         if not paper_enable_virtual_sell_plan() or not legs:
             continue
 
@@ -562,8 +886,12 @@ def _update_and_exit_open_positions(
             realized += pnl
             cash += proceeds - fee_out_sum
             pos["status"] = "closed"
+            pos["lifecycle_status"] = "closed"
             pos["closed_at_utc"] = now.replace(microsecond=0).isoformat()
             pos["realized_pnl"] = round(pnl, 4)
+            pos["trade_pnl_pre_settlement"] = round(pnl, 4)
+            pos["settlement_pnl"] = 0.0
+            pos["final_pnl"] = round(pnl, 4)
             pos["exit_kind"] = "all_legs_hit"
             closed.append(pos)
             to_del.append(slug)
@@ -574,6 +902,10 @@ def _update_and_exit_open_positions(
                 {
                     "event_slug": slug,
                     "paper_trade_id": pos.get("paper_trade_id"),
+                    "lifecycle_status": pos.get("lifecycle_status"),
+                    "trade_pnl_pre_settlement": pos.get("trade_pnl_pre_settlement"),
+                    "settlement_pnl": pos.get("settlement_pnl"),
+                    "final_pnl": pos.get("final_pnl"),
                     "realized_pnl": round(pnl, 4),
                     "cash_after": round(cash, 4),
                     "exit_kind": "all_legs_hit",
@@ -599,7 +931,7 @@ def _update_and_exit_open_positions(
 
         # independent_leg_exit: закрываем ноги по одной при достижении target
         for leg in legs:
-            if leg.get("status") == "closed_virtual":
+            if not _leg_is_active(leg):
                 continue
             mk = _find_market_for_leg(markets, leg)
             if mk is None:
@@ -629,6 +961,8 @@ def _update_and_exit_open_positions(
             leg["closed_at_utc"] = now.replace(microsecond=0).isoformat()
             leg["virtual_realized_pnl"] = round(leg_pnl, 4)
             leg["exit_fee_paid"] = fee_out_leg
+            if pos.get("lifecycle_status") == "open":
+                pos["lifecycle_status"] = "partially_closed"
             ex["independent_leg_target_hit"] = int(ex.get("independent_leg_target_hit") or 0) + 1
             _journal(
                 journal_path,
@@ -660,14 +994,18 @@ def _update_and_exit_open_positions(
             except Exception:
                 pass
 
-        open_legs = [lg for lg in legs if lg.get("status") != "closed_virtual"]
+        open_legs = [lg for lg in legs if _leg_is_active(lg)]
         if open_legs:
             continue
 
         pos["status"] = "closed"
+        pos["lifecycle_status"] = "closed"
         pos["closed_at_utc"] = now.replace(microsecond=0).isoformat()
         total_leg_pnl = sum(float(lg.get("virtual_realized_pnl") or 0) for lg in legs)
         pos["realized_pnl"] = round(total_leg_pnl, 4)
+        pos["trade_pnl_pre_settlement"] = round(total_leg_pnl, 4)
+        pos["settlement_pnl"] = 0.0
+        pos["final_pnl"] = round(total_leg_pnl, 4)
         pos["exit_kind"] = "independent_all_legs_done"
         closed.append(pos)
         to_del.append(slug)
@@ -677,6 +1015,10 @@ def _update_and_exit_open_positions(
             {
                 "event_slug": slug,
                 "paper_trade_id": pos.get("paper_trade_id"),
+                "lifecycle_status": pos.get("lifecycle_status"),
+                "trade_pnl_pre_settlement": pos.get("trade_pnl_pre_settlement"),
+                "settlement_pnl": pos.get("settlement_pnl"),
+                "final_pnl": pos.get("final_pnl"),
                 "realized_pnl": round(total_leg_pnl, 4),
                 "cash_after": round(cash, 4),
                 "exit_kind": "independent_all_legs_done",
@@ -712,7 +1054,7 @@ def _update_and_exit_open_positions(
 def _leg_sum_unrealized(pos: dict[str, Any]) -> float:
     s = 0.0
     for leg in pos.get("legs") or []:
-        if leg.get("status") == "closed_virtual":
+        if not _leg_is_active(leg):
             continue
         u = leg.get("current_unrealized_pnl_estimate")
         if isinstance(u, (int, float)):

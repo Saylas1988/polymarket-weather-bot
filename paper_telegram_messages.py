@@ -12,10 +12,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from paper_portfolio import load_portfolio
+from paper_portfolio_risk import refresh_portfolio_risk_state
 from paper_settings import (
     allocation_logic_version,
     exit_logic_version,
     fee_logic_version,
+    paper_repricing_trade_logic_version,
+    paper_repricing_v2_enabled,
     paper_start_balance,
     paper_trading_enabled,
 )
@@ -55,6 +58,7 @@ def format_paper_entry_message(
     allocator_notes: list[str] | None,
     neighbor_cuts: list[str] | None,
     target_summary: dict[str, Any] | None,
+    strategy_mode: str = "",
 ) -> str:
     notes = allocator_notes or []
     cuts = neighbor_cuts or []
@@ -63,6 +67,11 @@ def format_paper_entry_message(
         alloc_brief += f" | {notes[0]}"
     if cuts:
         alloc_brief += f" | cuts:{len(cuts)}"
+    mode_line = ""
+    if strategy_mode == "repricing_trade":
+        mode_line = "mode: repricing_trade (D+1 scalp | time+drift exits)"
+    elif strategy_mode:
+        mode_line = f"mode: {strategy_mode}"
     lines = [
         "📌 PAPER ENTRY",
         f"{display_name_en} | D+{depth if depth is not None else '?'} | st {station_code or '—'}",
@@ -72,6 +81,8 @@ def format_paper_entry_message(
         f"allocator: {alloc_brief}",
         _target_line(target_summary),
     ]
+    if mode_line:
+        lines.insert(2, mode_line)
     return "\n".join(lines)
 
 
@@ -136,6 +147,8 @@ def format_daily_telegram_summary(for_day_msk: date | None = None) -> str:
     msk = ZoneInfo("Europe/Moscow")
     d = for_day_msk or datetime.now(msk).date()
     port = load_portfolio()
+    refresh_portfolio_risk_state(port)
+    rs = port.get("risk_state") or {}
     cash = float(port.get("current_cash") or 0)
     realized = float(port.get("realized_pnl") or 0)
     unreal = float(port.get("unrealized_pnl_estimate") or 0)
@@ -162,10 +175,25 @@ def format_daily_telegram_summary(for_day_msk: date | None = None) -> str:
         best = f"{items[0][0]} (${items[0][1]:+.2f})"
         worst = f"{items[-1][0]} (${items[-1][1]:+.2f})"
 
+    risk_line = "risk: —"
+    if rs:
+        mode = rs.get("risk_mode") or "?"
+        tex = rs.get("total_open_exposure_pct")
+        teu = rs.get("total_open_exposure_usd")
+        dd = rs.get("unrealized_drawdown_pct_of_bankroll")
+        if isinstance(tex, (int, float)):
+            risk_line = (
+                f"risk: mode={mode} | open exp~ {float(tex)*100:.1f}% (${float(teu):.2f})"
+                f" | unreal DD~ {float(dd)*100:.2f}% bankroll"
+            )
+        else:
+            risk_line = f"risk: mode={mode}"
+
     lines = [
         f"📊 PAPER DAILY SUMMARY ({d.isoformat()} МСК)",
         f"cash: ${cash:.2f} | realized: ${realized:.2f} | unreal~: ${unreal:.2f}",
         f"open positions: {open_n}",
+        risk_line,
         f"today activity: entries +{ent} | exits {ex} | skipped {sk}",
         f"structures (cumulative): ladder_3={se.get('ladder_3', 0)} single={se.get('single_bucket', 0)}",
         f"best / worst city (closed that day): {best} / {worst}",
@@ -177,6 +205,8 @@ def format_daily_telegram_summary(for_day_msk: date | None = None) -> str:
 def format_weekly_telegram_summary(week_end_msk: date | None = None) -> str:
     d = week_end_msk or datetime.now(ZoneInfo("Europe/Moscow")).date()
     port = load_portfolio()
+    refresh_portfolio_risk_state(port)
+    rs = port.get("risk_state") or {}
     starting = float(port.get("starting_balance") or paper_start_balance())
     cash = float(port.get("current_cash") or 0)
     unreal = float(port.get("unrealized_pnl_estimate") or 0)
@@ -205,9 +235,15 @@ def format_weekly_telegram_summary(week_end_msk: date | None = None) -> str:
     skip_txt = json.dumps(skipped, ensure_ascii=False) if skipped else "—"
     if len(skip_txt) > 220:
         skip_txt = skip_txt[:217] + "..."
+    rsk = ""
+    if rs:
+        mode = rs.get("risk_mode") or "?"
+        tex = rs.get("total_open_exposure_pct")
+        rsk = f" | risk {mode} | open exp~ {float(tex)*100:.1f}%" if isinstance(tex, (int, float)) else f" | risk {mode}"
+
     lines = [
         f"📅 PAPER WEEKLY SUMMARY (week end {d.isoformat()} МСК)",
-        f"start ${starting:.2f} | equity~ ${equity:.2f} | cash ${cash:.2f}",
+        f"start ${starting:.2f} | equity~ ${equity:.2f} | cash ${cash:.2f}{rsk}",
         f"realized: ${realized:.2f} | unreal~: ${unreal:.2f} | ROI: {roi*100:.2f}%",
         f"entries (total): {taken} | exits (closed pos): {closed_n} | skips (total): {total_skipped}",
         f"skip breakdown: {skip_txt}",
@@ -219,6 +255,8 @@ def format_weekly_telegram_summary(week_end_msk: date | None = None) -> str:
 
 def format_paper_status_message() -> str:
     port = load_portfolio()
+    refresh_portfolio_risk_state(port)
+    rs = port.get("risk_state") or {}
     on = paper_trading_enabled()
     cash = float(port.get("current_cash") or 0)
     open_n = len(port.get("open_positions") or {})
@@ -241,13 +279,32 @@ def format_paper_status_message() -> str:
     except Exception:
         pass
 
+    risk_extra = ""
+    if rs:
+        mode = rs.get("risk_mode") or "?"
+        pct = rs.get("total_open_exposure_pct")
+        pct_s = f"{float(pct)*100:.1f}%" if isinstance(pct, (int, float)) else "?"
+        dd = rs.get("unrealized_drawdown_pct_of_bankroll")
+        dd_s = f"{float(dd)*100:.2f}%" if isinstance(dd, (int, float)) else "?"
+        bc = rs.get("by_city") or {}
+        conc = ", ".join(f"{k}:{int(v.get('open_events',0))}" for k, v in list(bc.items())[:6])
+        risk_extra = f"risk mode: {mode} | open exp~ {pct_s} bankroll | unreal DD~ {dd_s} | by city (n): {conc or '—'}"
+
+    rpv2 = "on" if paper_repricing_v2_enabled() else "off"
     lines = [
         "📎 PAPER STATUS",
         f"enabled: {'yes' if on else 'no'}",
+        f"repricing v2: {rpv2} ({paper_repricing_trade_logic_version()})",
         f"cash: ${cash:.2f} | open: {open_n} | closed (total): {closed_n}",
         f"realized: ${realized:.2f} | unreal~: ${unreal:.2f}",
         f"signals taken: {taken} | skipped: {skipped}",
-        f"last portfolio update: {lu}",
-        f"last journal: {last}",
     ]
+    if risk_extra:
+        lines.append(risk_extra)
+    lines.extend(
+        [
+            f"last portfolio update: {lu}",
+            f"last journal: {last}",
+        ]
+    )
     return "\n".join(lines)
